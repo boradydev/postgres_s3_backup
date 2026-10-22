@@ -1,5 +1,6 @@
 name: Backup service CI
 on:
+  workflow_call:
   push:
     branches: [master]
   pull_request:
