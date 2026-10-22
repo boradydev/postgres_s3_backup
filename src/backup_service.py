@@ -26,8 +26,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 
 logger = logging.getLogger("backup")
-MOSCOW = ZoneInfo("Europe/Moscow")
-CATEGORIES = ("daily", "predeploy")
+CATEGORIES = ("daily", "manual", "predeploy")
 NAME = re.compile(r"\d{8}T\d{6}Z-[a-f0-9]{32}\.json\Z")
 STOP = threading.Event()
 
@@ -45,12 +44,43 @@ class Settings:
     directory: Path
     database: str
     keep: int = 30
+    manual_keep: int = 30
+    predeploy_keep: int = 30
+    retry_interval: int = 300
+    poll_interval: int = 60
     timeout: int = 1800
     schedule: str = "17:00"
     timezone: str = "Europe/Moscow"
 
     @classmethod
     def from_env(cls) -> "Settings":
+        required = (
+            "POSTGRES_HOST", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD",
+            "BACKUP_S3_ENDPOINT", "BACKUP_S3_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+        )
+        for name in required:
+            if not os.environ.get(name):
+                raise BackupError(f"{name} is required")
+
+        def positive(name: str, default: int) -> int:
+            try:
+                value = int(os.environ.get(name, str(default)))
+            except ValueError:
+                raise BackupError(f"{name} must be a positive integer") from None
+            if value < 1:
+                raise BackupError(f"{name} must be a positive integer")
+            return value
+
+        for name in (
+            "BACKUP_S3_REGION", "BACKUP_S3_PREFIX", "BACKUP_STATE_DIR", "BACKUP_TIME", "BACKUP_TIMEZONE",
+        ):
+            if name in os.environ and not os.environ[name].strip():
+                raise BackupError(f"{name} must not be empty")
+        if os.environ.get("BACKUP_ALLOW_HTTP", "0") not in ("0", "1"):
+            raise BackupError("BACKUP_ALLOW_HTTP must be 0 or 1")
+        port = positive("POSTGRES_PORT", 5432)
+        if port > 65535:
+            raise BackupError("POSTGRES_PORT must be between 1 and 65535")
         endpoint = os.environ["BACKUP_S3_ENDPOINT"]
         if not endpoint.startswith("https://") and os.environ.get("BACKUP_ALLOW_HTTP") != "1":
             raise BackupError("S3 endpoint must use HTTPS")
@@ -60,9 +90,7 @@ class Settings:
             raise BackupError("Invalid S3 prefix")
         if not re.fullmatch(r"[a-zA-Z0-9_]+", database):
             raise BackupError("Invalid database name")
-        keep = int(os.environ.get("BACKUP_KEEP", "30"))
-        if keep < 1:
-            raise BackupError("BACKUP_KEEP must be positive")
+        keep = positive("BACKUP_KEEP", 30)
         schedule = os.environ.get("BACKUP_TIME", "17:00")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", schedule):
             raise BackupError("BACKUP_TIME must be HH:MM")
@@ -76,6 +104,11 @@ class Settings:
             directory=Path(os.environ.get("BACKUP_STATE_DIR", "/state")),
             database=database,
             keep=keep,
+            manual_keep=positive("BACKUP_MANUAL_KEEP", 30),
+            predeploy_keep=positive("BACKUP_PREDEPLOY_KEEP", 30),
+            timeout=positive("BACKUP_DUMP_TIMEOUT", 1800),
+            retry_interval=positive("BACKUP_RETRY_INTERVAL", 300),
+            poll_interval=positive("BACKUP_POLL_INTERVAL", 60),
             schedule=schedule,
             timezone=timezone,
         )
@@ -320,7 +353,12 @@ class Backup:
                             raise BackupError("Old backup size mismatch; retention aborted")
                         candidates.append((manifest["createdAt"], key, manifest["dumpKey"]))
             # До первой операции удаления проверяем все кандидаты категории.
-            for _, key, dump_key in sorted(candidates, reverse=True)[self.settings.keep :]:
+            keep = {
+                "daily": self.settings.keep,
+                "manual": self.settings.manual_keep,
+                "predeploy": self.settings.predeploy_keep,
+            }[category]
+            for _, key, dump_key in sorted(candidates, reverse=True)[keep:]:
                 save_json(journal, {"scope": self.scope, "manifestKey": key, "dumpKey": dump_key})
                 self.finish_deletion(journal)
 
@@ -356,6 +394,8 @@ class Backup:
         self.store(state)
 
     def run(self, category: str, *, scheduled: bool = False, now: datetime | None = None) -> dict[str, Any]:
+        if category not in CATEGORIES or (scheduled and category != "daily"):
+            raise BackupError("Invalid backup category for this command")
         with self.locked():
             self.state()
             resumed = None
@@ -387,7 +427,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve")
     run = sub.add_parser("run")
-    run.add_argument("--category", choices=CATEGORIES, default="daily")
+    run.add_argument("--category", choices=CATEGORIES, default="manual")
     sub.add_parser("status")
     download = sub.add_parser("download")
     download.add_argument("--manifest", required=True)
@@ -411,9 +451,9 @@ def main() -> int:
                 except Exception as exc:
                     logger.error("Backup attempt failed: %s", safe_error(exc))
                     backup.record_error(exc)
-                    STOP.wait(300)
+                    STOP.wait(backup.settings.retry_interval)
                 else:
-                    STOP.wait(60)
+                    STOP.wait(backup.settings.poll_interval)
         return 0
     except (BackupError, BotoCoreError, ClientError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         logger.error("Backup command failed: %s", safe_error(exc))

@@ -1,6 +1,7 @@
 import hashlib
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -190,3 +191,74 @@ def test_failed_dump_is_not_uploaded_or_confirmed(backup) -> None:
     assert not backup.client.deleted
     assert "coveredSlot" not in backup.state()
 
+
+
+@pytest.fixture
+def configured_env(monkeypatch):
+    monkeypatch.setattr("os.environ", {
+        "POSTGRES_HOST": "postgres", "POSTGRES_DB": "db", "POSTGRES_USER": "backup",
+        "POSTGRES_PASSWORD": "test-only", "BACKUP_S3_ENDPOINT": "https://example.invalid",
+        "BACKUP_S3_BUCKET": "bucket", "AWS_ACCESS_KEY_ID": "test-only",
+        "AWS_SECRET_ACCESS_KEY": "test-only",
+    })
+
+
+def test_required_only_configuration_uses_behavior_defaults(configured_env) -> None:
+    del configured_env
+    settings = Settings.from_env()
+    assert (settings.keep, settings.manual_keep, settings.predeploy_keep) == (30, 30, 30)
+    assert (settings.timeout, settings.retry_interval, settings.poll_interval) == (1800, 300, 60)
+    assert (settings.schedule, settings.timezone) == ("17:00", "Europe/Moscow")
+    assert settings.prefix == "postgres-backups/production/db/"
+
+
+def test_behavior_can_be_overridden(configured_env, monkeypatch) -> None:
+    del configured_env
+    values = {
+        "BACKUP_KEEP": "4", "BACKUP_MANUAL_KEEP": "2", "BACKUP_PREDEPLOY_KEEP": "3",
+        "BACKUP_DUMP_TIMEOUT": "900", "BACKUP_RETRY_INTERVAL": "120", "BACKUP_POLL_INTERVAL": "15",
+        "BACKUP_TIME": "09:30", "BACKUP_TIMEZONE": "UTC",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    settings = Settings.from_env()
+    assert (settings.keep, settings.manual_keep, settings.predeploy_keep) == (4, 2, 3)
+    assert (settings.timeout, settings.retry_interval, settings.poll_interval) == (900, 120, 15)
+    assert (settings.schedule, settings.timezone) == ("09:30", "UTC")
+
+
+@pytest.mark.parametrize("name", [
+    "POSTGRES_HOST", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD",
+    "BACKUP_S3_ENDPOINT", "BACKUP_S3_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+])
+def test_missing_connection_setting_fails_before_backup(configured_env, monkeypatch, name) -> None:
+    del configured_env
+    monkeypatch.delenv(name)
+    with pytest.raises(BackupError, match=f"{name} is required"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize(("name", "value"), [
+    ("BACKUP_KEEP", "0"), ("BACKUP_MANUAL_KEEP", "-1"), ("BACKUP_PREDEPLOY_KEEP", "no"),
+    ("BACKUP_DUMP_TIMEOUT", ""), ("BACKUP_RETRY_INTERVAL", "0"), ("BACKUP_POLL_INTERVAL", "1.5"),
+    ("POSTGRES_PORT", "65536"),
+])
+def test_invalid_numeric_setting_fails_without_exposing_value(configured_env, monkeypatch, name, value) -> None:
+    del configured_env
+    monkeypatch.setenv(name, value)
+    with pytest.raises(BackupError, match=name):
+        Settings.from_env()
+
+
+def test_manual_backups_have_independent_retention_and_do_not_cover_schedule(backup) -> None:
+    backup.settings = replace(backup.settings, keep=2, manual_keep=1, predeploy_keep=3)
+    for _ in range(4):
+        backup.run("manual")
+        backup.run("predeploy")
+    assert "coveredSlot" not in backup.state()
+    for day in (1, 2, 3):
+        backup.run("daily", scheduled=True, now=moment(day))
+    assert len(markers(backup, "manual")) == 1
+    assert len(markers(backup, "predeploy")) == 3
+    assert len(markers(backup, "daily")) == 2
+    assert backup.state()["coveredSlot"] == moment(3).isoformat()
